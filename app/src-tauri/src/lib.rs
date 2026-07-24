@@ -1,9 +1,9 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    env, fs,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -97,6 +97,96 @@ const LEGACY_DATABASE_FILE: &str = "video-knowledge.sqlite3";
 const DATABASE_FILE: &str = "quickvideo.sqlite3";
 const DEFAULT_SUMMARY_PROMPT: &str = "请将下面的视频字幕整理为中文 Markdown 笔记。\n\n请包含：\n1. 一句话概览\n2. 3-5 条核心收获\n3. 按时间切分的章节：每章包含标题、时间范围和要点\n\n只基于字幕中的信息，不要编造事实。";
 
+fn executable_name(tool: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    }
+}
+
+fn bundled_tool_paths(tool: &str) -> Vec<PathBuf> {
+    let executable = executable_name(tool);
+    let mut paths = Vec::new();
+
+    if let Some(directory) = env::var_os("QUICKVIDEO_TOOLS_DIR") {
+        paths.push(PathBuf::from(directory).join(&executable));
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(directory) = current_exe.parent() {
+            // A portable Windows installation can keep its companion tools
+            // beside the app in a `tools` directory.
+            paths.push(directory.join("tools").join(&executable));
+
+            #[cfg(target_os = "macos")]
+            if let Some(contents) = directory.parent() {
+                paths.push(contents.join("Resources").join("tools").join(&executable));
+            }
+        }
+    }
+
+    paths
+}
+
+fn tool_install_hint(tool: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!(
+            "未找到 {tool}。请安装对应的 Windows 工具并将其加入 PATH，或把 {} 放到 QuickVideo.exe 同级的 tools 文件夹。",
+            executable_name(tool)
+        )
+    } else {
+        format!("未找到 {tool}。请安装对应工具并将其加入 PATH；macOS 可通过 Homebrew 安装。")
+    }
+}
+
+/// Resolve tools from an explicitly configured directory, a bundled `tools`
+/// directory, the process PATH, and the standard Homebrew locations on macOS.
+fn tool_path(tool: &str) -> Result<PathBuf, String> {
+    let executable = executable_name(tool);
+    let mut candidates = bundled_tool_paths(tool);
+
+    if let Some(path) = env::var_os("PATH") {
+        candidates.extend(env::split_paths(&path).map(|directory| directory.join(&executable)));
+    }
+
+    #[cfg(target_os = "macos")]
+    candidates.extend(
+        ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+            .iter()
+            .map(|directory| Path::new(directory).join(&executable)),
+    );
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| tool_install_hint(tool))
+}
+
+fn ytdlp_command() -> Result<Command, String> {
+    let ytdlp = tool_path("yt-dlp")?;
+    let ffmpeg = tool_path("ffmpeg")?;
+    let mut command = Command::new(ytdlp);
+
+    // yt-dlp launches ffmpeg and ffprobe as child processes. Supplying their
+    // directory keeps this reliable when the desktop app does not inherit the
+    // interactive shell PATH (notably Finder on macOS).
+    command.arg("--ffmpeg-location").arg(
+        ffmpeg
+            .parent()
+            .ok_or_else(|| "无法确定 FFmpeg 安装目录。".to_string())?,
+    );
+
+    // YouTube extraction increasingly requires a JavaScript runtime. Deno is
+    // supported by yt-dlp and uses the same cross-platform resolution logic.
+    if let Ok(deno) = tool_path("deno") {
+        command
+            .arg("--js-runtimes")
+            .arg(format!("deno:{}", deno.display()));
+    }
+    Ok(command)
+}
+
 fn migrate_legacy_app_data(app: &tauri::AppHandle) -> Result<(), String> {
     let current_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&current_dir).map_err(|e| e.to_string())?;
@@ -143,13 +233,15 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 #[tauri::command]
 fn check_runtime(app: tauri::AppHandle) -> Result<RuntimeStatus, String> {
-    let available = |path: &str| Command::new(path).arg("--version").output().is_ok();
+    let available = |tool: &str| {
+        tool_path(tool).is_ok_and(|path| Command::new(path).arg("--version").output().is_ok())
+    };
     let model = base_model_path(&app)?.exists();
     Ok(RuntimeStatus {
-        ffmpeg: available("/opt/homebrew/bin/ffmpeg"),
-        whisper: available("/opt/homebrew/bin/whisper-cli"),
+        ffmpeg: available("ffmpeg"),
+        whisper: available("whisper-cli"),
         model,
-        ytdlp: available("/opt/homebrew/bin/yt-dlp"),
+        ytdlp: available("yt-dlp"),
     })
 }
 
@@ -311,7 +403,7 @@ async fn get_local_duration(input_path: String) -> Result<String, String> {
 }
 
 fn get_local_duration_blocking(input_path: String) -> Result<String, String> {
-    let output = Command::new("/opt/homebrew/bin/ffprobe")
+    let output = Command::new(tool_path("ffprobe")?)
         .args([
             "-v",
             "error",
@@ -344,7 +436,7 @@ fn get_link_metadata_blocking(url: String) -> Result<MediaMetadata, String> {
     if !(url.contains("youtube.com") || url.contains("youtu.be") || url.contains("bilibili.com")) {
         return Err("目前仅支持 YouTube 与 Bilibili 链接。".into());
     }
-    let output = Command::new("/opt/homebrew/bin/yt-dlp")
+    let output = ytdlp_command()?
         .args([
             "--no-playlist",
             "--skip-download",
@@ -406,19 +498,54 @@ fn download_base_model(app: tauri::AppHandle) -> Result<String, String> {
         let _ = fs::remove_file(&temporary);
         return Err("下载的模型文件不完整，请检查网络后重试。".into());
     }
-    let digest = Command::new("/usr/bin/shasum")
-        .args(["-a", "1"])
-        .arg(&temporary)
-        .output()
-        .map_err(|e| format!("无法校验模型文件：{e}"))?;
-    let checksum_output = String::from_utf8_lossy(&digest.stdout);
-    let actual = checksum_output.split_whitespace().next().unwrap_or("");
-    if !digest.status.success() || actual != BASE_MODEL_SHA1 {
+    if sha1_file(&temporary)? != BASE_MODEL_SHA1 {
         let _ = fs::remove_file(&temporary);
         return Err("模型校验失败，文件未被保存。请检查网络后重试。".into());
     }
     fs::rename(&temporary, &model).map_err(|e| e.to_string())?;
     Ok(model.to_string_lossy().into_owned())
+}
+
+fn sha1_file(path: &Path) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let output = Command::new("certutil")
+        .args(["-hashfile"])
+        .arg(path)
+        .arg("SHA1")
+        .output()
+        .map_err(|e| format!("无法校验模型文件：{e}"))?;
+
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new("shasum")
+        .args(["-a", "1"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("无法校验模型文件：{e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+
+    let checksum_output = String::from_utf8_lossy(&output.stdout);
+    checksum_output
+        .split_whitespace()
+        .find(|value| {
+            value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase)
+        // `certutil` prints the Windows hash in groups separated by spaces.
+        .or_else(|| {
+            checksum_output
+                .lines()
+                .map(|line| {
+                    line.chars()
+                        .filter(|character| character.is_ascii_hexdigit())
+                        .collect::<String>()
+                })
+                .find(|value| value.len() == 40)
+                .map(|value| value.to_ascii_lowercase())
+        })
+        .ok_or_else(|| "无法读取模型文件的 SHA-1 校验值。".to_string())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -967,7 +1094,7 @@ fn transcribe_local_file_blocking(
     let id = chrono::Utc::now().timestamp_millis();
     let wav = work.join(format!("{id}.wav"));
     let output = work.join(format!("{id}-transcript"));
-    let ffmpeg = Command::new("/opt/homebrew/bin/ffmpeg")
+    let ffmpeg = Command::new(tool_path("ffmpeg")?)
         .args([
             "-y",
             "-i",
@@ -990,7 +1117,7 @@ fn transcribe_local_file_blocking(
         return Err("未找到本地语音模型，请在设置中下载模型。".into());
     }
     let language = whisper_language(&app);
-    let whisper = Command::new("/opt/homebrew/bin/whisper-cli")
+    let whisper = Command::new(tool_path("whisper-cli")?)
         .args(["-m"])
         .arg(model)
         .args(["-f"])
@@ -1034,7 +1161,7 @@ fn transcribe_platform_link_blocking(app: tauri::AppHandle, url: String) -> Resu
         "link-audio-{}",
         chrono::Utc::now().timestamp_millis()
     ));
-    let downloaded = Command::new("/opt/homebrew/bin/yt-dlp")
+    let downloaded = ytdlp_command()?
         .args(["--no-playlist", "-x", "--audio-format", "wav", "-o"])
         .arg(format!("{}.%(ext)s", prefix.display()))
         .arg(&url)
@@ -1074,7 +1201,7 @@ fn transcribe_platform_link_blocking(app: tauri::AppHandle, url: String) -> Resu
         }
         return Err("未找到本地语音模型，请在设置中下载模型。".into());
     }
-    let whisper = Command::new("/opt/homebrew/bin/whisper-cli")
+    let whisper = Command::new(tool_path("whisper-cli")?)
         .args(["-m"])
         .arg(model)
         .args(["-f"])
@@ -1149,7 +1276,7 @@ fn fetch_platform_subtitles_blocking(
         .ok_or_else(|| "无法创建临时字幕文件。".to_string())?
         .to_string_lossy()
         .into_owned();
-    let manual = Command::new("/opt/homebrew/bin/yt-dlp")
+    let manual = ytdlp_command()?
         .args([
             "--skip-download",
             "--write-subs",
@@ -1169,7 +1296,7 @@ fn fetch_platform_subtitles_blocking(
             source: "平台人工字幕".into(),
         });
     }
-    let automatic = Command::new("/opt/homebrew/bin/yt-dlp")
+    let automatic = ytdlp_command()?
         .args([
             "--skip-download",
             "--write-auto-subs",

@@ -1,4 +1,4 @@
-# 快看视频 QuickVideo（Apple Silicon Mac MVP）
+# 快看视频 QuickVideo（macOS / Windows MVP）
 
 把一段 YouTube / Bilibili 视频的可用字幕，或用户选择的本地音视频，整理成可导出的 Markdown 视频笔记。
 
@@ -13,18 +13,16 @@
 
 ## 试用版安装与运行
 
-最新调试构建产物：
+macOS 调试构建产物：
 
 - `src-tauri/target/debug/bundle/macos/QuickVideo.app`
 - `src-tauri/target/debug/bundle/dmg/QuickVideo_0.1.0_aarch64.dmg`
 
-本机开发环境所需的运行时：
+本机运行时：
 
-- Apple Silicon Mac
-- `/opt/homebrew/bin/ffmpeg`
-- `/opt/homebrew/bin/whisper-cli`
-- `/opt/homebrew/bin/yt-dlp`（仅链接字幕）
-- `~/Library/Application Support/com.maximusmol.quickvideo/models/ggml-base.bin`
+- macOS：通过 Homebrew 或其他方式安装 `ffmpeg`、`whisper-cli` 与 `yt-dlp`（仅链接字幕）；应用会额外检查 `/opt/homebrew/bin` 与 `/usr/local/bin`。
+- Windows：安装 `ffmpeg.exe`、`whisper-cli.exe` 与 `yt-dlp.exe` 并加入系统 `PATH`；也可将它们放入 `QuickVideo.exe` 同级的 `tools` 文件夹。可用 `QUICKVIDEO_TOOLS_DIR` 指向自定义工具目录。
+- 本地模型保存于各系统的 QuickVideo 应用数据目录；缺少时可在应用“设置”页下载。
 
 应用会在启动时检查这些组件。首次启动新版时，会自动迁移旧版 Video Knowledge 的资料库和本地转写模型；缺少组件时，本地导入或链接字幕会失败，但已有笔记仍可浏览、导出。
 
@@ -34,16 +32,22 @@
 
 ```bash
 cd app
-PATH=/opt/homebrew/bin:$PATH npm run tauri dev
+npm run tauri dev
 ```
 
 验证与打包：
 
 ```bash
-PATH=/opt/homebrew/bin:$PATH npm run build
-PATH=/opt/homebrew/bin:$PATH cargo check --manifest-path src-tauri/Cargo.toml
-PATH=/opt/homebrew/bin:$PATH npm run tauri build -- --debug
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run tauri build -- --debug
 ```
+
+## 自动构建与发布
+
+GitHub Actions 工作流位于 [`.github/workflows/build-desktop.yml`](../.github/workflows/build-desktop.yml)。普通分支提交或手动运行仅构建并保存 7 天的测试 Artifact；推送形如 `v1.0.0` 的标签时，工作流会构建 macOS 与 Windows 安装包，并自动创建 GitHub Release。
+
+macOS 正式分发仍需要在 GitHub Secrets 中配置 Apple 签名与公证凭据；Windows 正式分发建议后续配置代码签名证书，以避免系统的未签名应用警告。
 
 ## 当前范围与发布前缺口
 
