@@ -1,11 +1,11 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import appIcon from "../src-tauri/icons/128x128.png";
 import "./App.css";
 
-type TaskState = "queued" | "transcribing" | "summarizing" | "completed" | "failed";
+type TaskState = "queued" | "preparing" | "transcribing" | "summarizing" | "cancelling" | "completed" | "failed" | "interrupted" | "orphaned" | "cancelled";
 type Screen = "library" | "setup" | "settings";
 
 type VideoTask = {
@@ -25,14 +25,24 @@ type PlatformSubtitles = { transcript: string; source: string };
 type MediaMetadata = { title: string; duration: string };
 type SelectedLocalFile = { path: string; name: string };
 type ApiCall = { id: number; createdAt: string; purpose: string; provider: string; baseUrl: string; model: string; success: boolean; statusCode?: number | null; durationMs: number; errorMessage?: string | null; traceId?: string | null; requestHeaders?: string | null; requestBody?: string | null; responseHeaders?: string | null; responseBody?: string | null };
+type ExportType = "summaryAndTranscript" | "summary" | "transcript";
 
 const stateCopy: Record<TaskState, string> = {
   queued: "等待处理",
+  preparing: "正在准备",
   transcribing: "正在转写",
   summarizing: "正在提炼章节",
+  cancelling: "正在终止",
   completed: "已生成笔记",
-  failed: "需要处理",
+  failed: "处理失败",
+  interrupted: "已中断",
+  orphaned: "遗留进程",
+  cancelled: "已终止",
 };
+
+const activeStates: TaskState[] = ["queued", "preparing", "transcribing", "summarizing", "cancelling"];
+const restartableStates: TaskState[] = ["failed", "interrupted", "cancelled"];
+const isCancellationError = (error: unknown) => String(error).includes("任务已由用户终止");
 
 function formatTaskTime(value: string): string {
   const instant = Date.parse(value);
@@ -63,9 +73,16 @@ function App() {
   const [notice, setNotice] = useState("本地优先处理，临时媒体将在完成后自动清理。");
   const [activeTask, setActiveTask] = useState<VideoTask | null>(null);
   const [screen, setScreen] = useState<Screen>("library");
+  const cancellingTaskIds = useRef(new Set<number>());
 
   useEffect(() => {
-    invoke<VideoTask[]>("list_tasks").then(setTasks).catch(() => setNotice("本地资料库暂不可用，请重新启动桌面 App。"));
+    invoke<number>("recover_incomplete_tasks")
+      .then((count) => {
+        if (count > 0) setNotice(`${count} 个任务在应用关闭后中断，可点击“重新开始”。`);
+        return invoke<VideoTask[]>("list_tasks");
+      })
+      .then(setTasks)
+      .catch(() => setNotice("本地资料库暂不可用，请重新启动桌面 App。"));
     invoke<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean }>("check_runtime").then((runtime) => { if (!runtime.ffmpeg || !runtime.whisper || !runtime.model) setNotice("本地转写组件尚未完整安装，请在设置中完成模型与工具检查。 "); }).catch(() => undefined);
   }, []);
   const updateTask = (id: number, changes: Partial<VideoTask>) => {
@@ -101,6 +118,8 @@ function App() {
   };
 
   const processLink = async (task: VideoTask, url: string) => {
+    await invoke("activate_task", { taskId: task.id });
+    updateTask(task.id, { state: "preparing", progress: 6, errorMessage: null });
     try {
       const metadata = await invoke<MediaMetadata>("get_link_metadata", { url });
       await updateTaskMetadata(task.id, { title: metadata.title, duration: metadata.duration });
@@ -112,24 +131,34 @@ function App() {
       let srt: string;
       let subtitleSource = "平台字幕";
       try {
-        const platformSubtitles = await invoke<PlatformSubtitles>("fetch_platform_subtitles", { url });
+        const platformSubtitles = await invoke<PlatformSubtitles>("fetch_platform_subtitles", { url, taskId: task.id });
         srt = platformSubtitles.transcript;
         subtitleSource = platformSubtitles.source;
       } catch {
         setNotice("平台没有可用字幕，正在临时提取音频并使用本机 whisper.cpp 转写…");
         updateTask(task.id, { state: "transcribing", progress: 38 });
-        srt = await invoke<string>("transcribe_platform_link", { url });
+        srt = await invoke<string>("transcribe_platform_link", { url, taskId: task.id });
         subtitleSource = "本地 whisper.cpp（临时音频）";
       }
       await finishTranscript(task, srt, subtitleSource);
       setNotice(`已保存${subtitleSource}与笔记（${srt.split("\n\n").length} 段）。`);
     } catch (error) {
-      updateTask(task.id, { state: "failed", progress: 0, errorMessage: String(error) });
-      setNotice(`无法完成链接分析：${String(error)}。可稍后重试，或导入已获授权的本地文件。`);
+      if (cancellingTaskIds.current.has(task.id) || isCancellationError(error)) {
+        updateTask(task.id, { state: "cancelled", progress: 0, errorMessage: null });
+        setNotice("任务已终止，相关临时资源将被清理。");
+      } else {
+        updateTask(task.id, { state: "failed", progress: 0, errorMessage: String(error) });
+        setNotice(`无法完成链接分析：${String(error)}。可稍后重新开始，或导入已获授权的本地文件。`);
+      }
+    } finally {
+      cancellingTaskIds.current.delete(task.id);
+      void invoke("release_task", { taskId: task.id });
     }
   };
 
   const processLocalFile = async (task: VideoTask, inputPath: string) => {
+    await invoke("activate_task", { taskId: task.id });
+    updateTask(task.id, { state: "preparing", progress: 6, errorMessage: null });
     try {
       const duration = await invoke<string>("get_local_duration", { inputPath });
       await updateTaskMetadata(task.id, { duration });
@@ -138,20 +167,48 @@ function App() {
     }
     updateTask(task.id, { state: "transcribing", progress: 12, errorMessage: null });
     try {
-      const srt = await invoke<string>("transcribe_local_file", { inputPath });
+      const srt = await invoke<string>("transcribe_local_file", { inputPath, taskId: task.id });
       await finishTranscript(task, srt, "本地 whisper.cpp");
       setNotice(`本地转写完成：已保存 ${srt.split("\n\n").length} 段字幕与笔记。`);
     } catch (error) {
-      updateTask(task.id, { state: "failed", progress: 0, errorMessage: String(error) });
-      setNotice(`本地转写失败：${String(error)}`);
+      if (cancellingTaskIds.current.has(task.id) || isCancellationError(error)) {
+        updateTask(task.id, { state: "cancelled", progress: 0, errorMessage: null });
+        setNotice("任务已终止，相关临时资源将被清理。");
+      } else {
+        updateTask(task.id, { state: "failed", progress: 0, errorMessage: String(error) });
+        setNotice(`本地转写失败：${String(error)}`);
+      }
+    } finally {
+      cancellingTaskIds.current.delete(task.id);
+      void invoke("release_task", { taskId: task.id });
     }
   };
 
   const retryTask = (task: VideoTask) => {
     if (!task.inputRef) { setNotice("这个早期任务没有保存输入来源，请重新添加一次。 "); return; }
     setNotice("正在重新处理任务…");
+    updateTask(task.id, { state: "queued", progress: 0, errorMessage: null });
     if (task.source.includes("链接")) void processLink(task, task.inputRef);
     else void processLocalFile(task, task.inputRef);
+  };
+
+  const terminateTask = async (task: VideoTask) => {
+    cancellingTaskIds.current.add(task.id);
+    updateTask(task.id, { state: "cancelling", progress: task.progress, errorMessage: null });
+    setNotice("正在终止任务并释放相关资源…");
+    try {
+      const signalled = await invoke<boolean>("cancel_task", { taskId: task.id });
+      if (!signalled) {
+        updateTask(task.id, { state: "cancelled", progress: 0, errorMessage: null });
+        cancellingTaskIds.current.delete(task.id);
+        void invoke("release_task", { taskId: task.id });
+        setNotice("任务已终止。未发现仍在运行的本地子进程。");
+      }
+    } catch (error) {
+      cancellingTaskIds.current.delete(task.id);
+      updateTask(task.id, { state: "failed", progress: 0, errorMessage: String(error) });
+      setNotice(`无法终止任务：${String(error)}`);
+    }
   };
 
   const submitLink = (event: FormEvent<HTMLFormElement>) => {
@@ -200,7 +257,7 @@ function App() {
   };
 
   const completedCount = tasks.filter((task) => task.state === "completed").length;
-  const isProcessing = tasks.some((task) => ["queued", "transcribing", "summarizing"].includes(task.state));
+  const isProcessing = tasks.some((task) => activeStates.includes(task.state));
 
   if (activeTask) {
     return <NoteDetail task={activeTask} onBack={() => setActiveTask(null)} onOpenSetup={() => { setActiveTask(null); setScreen("setup"); }} />;
@@ -321,14 +378,15 @@ function App() {
                     <span className="status"><i />{stateCopy[task.state]}</span>
                   </div>
                   <p>{task.source} <b>·</b> {task.duration}</p>
-                  {task.state !== "completed" && (
-                    <div className={`progress ${["transcribing", "summarizing"].includes(task.state) ? "running" : ""}`} aria-label={`${task.progress}% 完成`}>
+                  {!(["completed", "failed", "interrupted", "cancelled", "orphaned"] as TaskState[]).includes(task.state) && (
+                    <div className={`progress ${["preparing", "transcribing", "summarizing", "cancelling"].includes(task.state) ? "running" : ""}`} aria-label={`${task.progress}% 完成`}>
                       <span style={{ width: `${task.progress}%` }} />
                     </div>
                   )}
                 </div>
                 <div className="task-time" title={task.createdAt}>{formatTaskTime(task.createdAt)}</div>
-                {task.state === "failed" && <button className="task-retry" type="button" onClick={() => retryTask(task)}>重试</button>}
+                {restartableStates.includes(task.state) && <button className="task-retry" type="button" onClick={() => retryTask(task)}>重新开始</button>}
+                {["preparing", "transcribing", "summarizing", "orphaned"].includes(task.state) && <button className="task-cancel" type="button" onClick={() => void terminateTask(task)}>终止</button>}
                 <button
                   className="task-open"
                   type="button"
@@ -400,6 +458,8 @@ function ProviderSetup({ onBack, onSaved }: { onBack: () => void; onSaved: () =>
 function SettingsPage({ onBack, onEditModel, onClearLibrary }: { onBack: () => void; onEditModel: () => void; onClearLibrary: () => void }) {
   const [cleanup, setCleanup] = useState(true);
   const [language, setLanguage] = useState("自动识别（中文 / English）");
+  const [summaryTimeoutManual, setSummaryTimeoutManual] = useState(false);
+  const [summaryTimeoutMinutes, setSummaryTimeoutMinutes] = useState(10);
   const [saved, setSaved] = useState("");
   const [runtime, setRuntime] = useState<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean } | null>(null);
   const [downloadingModel, setDownloadingModel] = useState(false);
@@ -407,11 +467,13 @@ function SettingsPage({ onBack, onEditModel, onClearLibrary }: { onBack: () => v
   const [callsLoading, setCallsLoading] = useState(false);
   const refreshRuntime = () => { void invoke<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean }>("check_runtime").then(setRuntime).catch(() => setRuntime(null)); };
   const refreshCalls = () => { setCallsLoading(true); void invoke<ApiCall[]>("list_api_calls").then(setApiCalls).catch(() => setApiCalls([])).finally(() => setCallsLoading(false)); };
-  useEffect(() => { invoke<{ cleanupTempMedia: boolean; transcriptionLanguage: string }>("get_preferences").then((value) => { setCleanup(value.cleanupTempMedia); setLanguage(value.transcriptionLanguage); }).catch(() => undefined); refreshRuntime(); refreshCalls(); }, []);
-  const persist = (nextCleanup: boolean, nextLanguage: string) => {
+  useEffect(() => { invoke<{ cleanupTempMedia: boolean; transcriptionLanguage: string; summaryTimeoutManual: boolean; summaryTimeoutMinutes: number }>("get_preferences").then((value) => { setCleanup(value.cleanupTempMedia); setLanguage(value.transcriptionLanguage); setSummaryTimeoutManual(value.summaryTimeoutManual); setSummaryTimeoutMinutes(value.summaryTimeoutMinutes); }).catch(() => undefined); refreshRuntime(); refreshCalls(); }, []);
+  const persist = (nextCleanup: boolean, nextLanguage: string, nextSummaryTimeoutManual = summaryTimeoutManual, nextSummaryTimeoutMinutes = summaryTimeoutMinutes) => {
     setCleanup(nextCleanup);
     setLanguage(nextLanguage);
-    void invoke("save_preferences", { cleanupTempMedia: nextCleanup, transcriptionLanguage: nextLanguage }).then(() => setSaved("已保存")).catch(() => setSaved("保存失败"));
+    setSummaryTimeoutManual(nextSummaryTimeoutManual);
+    setSummaryTimeoutMinutes(nextSummaryTimeoutMinutes);
+    void invoke("save_preferences", { cleanupTempMedia: nextCleanup, transcriptionLanguage: nextLanguage, summaryTimeoutManual: nextSummaryTimeoutManual, summaryTimeoutMinutes: nextSummaryTimeoutMinutes }).then(() => setSaved("已保存")).catch(() => setSaved("保存失败"));
   };
   return (
     <main className="settings-page">
@@ -424,6 +486,7 @@ function SettingsPage({ onBack, onEditModel, onClearLibrary }: { onBack: () => v
           <section><div><p>本地处理工具</p><span>{runtime ? `FFmpeg ${runtime.ffmpeg ? "✓" : "缺失"} · whisper.cpp ${runtime.whisper ? "✓" : "缺失"} · yt-dlp ${runtime.ytdlp ? "✓" : "缺失"}` : "正在检查运行环境…"}</span></div><button type="button" onClick={refreshRuntime}>重新检查</button></section>
           <section><div><p>默认转写语言</p><span>用于本地 whisper.cpp 的语言提示</span></div><select value={language} onChange={(event) => persist(cleanup, event.target.value)}><option>自动识别（中文 / English）</option><option>中文</option><option>English</option></select></section>
           <section><div><p>任务完成后删除临时媒体</p><span>只保留字幕、笔记和视频元数据</span></div><button className={`toggle ${cleanup ? "on" : ""}`} onClick={() => persist(!cleanup, language)} type="button" aria-label="切换清理临时媒体"><i /></button></section>
+          <section className="model-timeout"><div><p>模型响应时长</p><span>测试 API Key 固定最多等待 30 秒</span><dl><div><dt>普通摘要生成</dt><dd>最长 {summaryTimeoutManual ? summaryTimeoutMinutes : 10} 分钟</dd></div><div><dt>流式摘要生成</dt><dd>最长 {summaryTimeoutManual ? summaryTimeoutMinutes : 10} 分钟</dd></div><div><dt>完整摘要任务</dt><dd>{summaryTimeoutManual ? `手动 · 最长 ${summaryTimeoutMinutes} 分钟` : "自动（推荐）· 最长 10 分钟"}</dd></div></dl></div><div className="timeout-controls"><label><span>手动设置</span><button className={`toggle ${summaryTimeoutManual ? "on" : ""}`} onClick={() => persist(cleanup, language, !summaryTimeoutManual)} type="button" aria-label="切换摘要等待时长手动设置"><i /></button></label>{summaryTimeoutManual && <select value={summaryTimeoutMinutes} onChange={(event) => persist(cleanup, language, true, Number(event.target.value))} aria-label="摘要最大等待时长">{[5, 10, 15, 20, 25, 30].map((minutes) => <option key={minutes} value={minutes}>{minutes} 分钟</option>)}</select>}</div></section>
           <section><div><p>笔记导出位置</p><span>每次导出时由 macOS 保存面板选择</span></div><span>Markdown</span></section>
           <section className="danger"><div><p>清空本地资料库</p><span>删除任务记录、字幕与笔记；不会影响原始视频。</span></div><button type="button" onClick={() => void ask("这会删除所有任务、字幕和笔记，且无法撤销。确定继续吗？", { title: "清空本地资料库", kind: "warning" }).then((accepted) => { if (accepted) onClearLibrary(); })}>清空资料库</button></section>
         </div>
@@ -475,14 +538,19 @@ function NoteDetail({ task, onBack, onOpenSetup }: { task: VideoTask; onBack: ()
     ["08:42", "四步学习工作流", "收集、理解、连接、输出：每一步都把内容向行动推进一点。"],
     ["23:16", "让系统长期运转", "通过固定回顾节奏与轻量输出，让知识库真正成为一个使用中的系统。"],
   ];
-  const exportNote = async () => {
+  const exportNote = async (exportType: ExportType) => {
+    const exportLabel: Record<ExportType, string> = {
+      summaryAndTranscript: "摘要和字幕",
+      summary: "摘要",
+      transcript: "字幕",
+    };
     const target = await save({
-      defaultPath: `${task.title}.md`,
+      defaultPath: `${task.title}-${exportLabel[exportType]}.md`,
       filters: [{ name: "Markdown", extensions: ["md"] }],
     });
     if (!target) return;
     try {
-      const path = await invoke<string>("export_markdown", { title: task.title, taskId: task.id, outputPath: target });
+      const path = await invoke<string>("export_markdown", { title: task.title, taskId: task.id, outputPath: target, exportType });
       setExportNotice(`已导出到 ${path}`);
     } catch (error) {
       setExportNotice(`导出失败：${String(error)}`);
@@ -512,7 +580,9 @@ function NoteDetail({ task, onBack, onOpenSetup }: { task: VideoTask; onBack: ()
         <div className="note-actions">
           <span className="saved-state"><i /> 已保存到本地</span>
           {savedNote && <button type="button" onClick={() => void regenerateSummary()} disabled={regenerating}>{regenerating ? "正在生成…" : "重新生成摘要"}</button>}
-          <button type="button" onClick={() => void exportNote()}>导出 Markdown ↓</button>
+          <button type="button" onClick={() => void exportNote("summaryAndTranscript")}>导出摘要和字幕 ↓</button>
+          <button type="button" onClick={() => void exportNote("summary")}>导出摘要 ↓</button>
+          <button type="button" onClick={() => void exportNote("transcript")}>导出字幕 ↓</button>
         </div>
       </header>
 

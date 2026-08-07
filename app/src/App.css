@@ -127,9 +127,15 @@ h2 { margin-bottom: 0; font: 600 25px/1.1 "Fraunces", "Songti SC", serif; letter
 .task-open:disabled { cursor: not-allowed; opacity: .28; }
 .task-retry { border: 1px solid #d87d6f; padding: 5px 8px; color: #b8483a; background: transparent; font-size: 10px; font-weight: 700; }
 .task-retry:hover { color: #fff; background: #d95a4b; }
+.task-cancel { border: 1px solid #a89884; padding: 5px 8px; color: #675f54; background: transparent; font-size: 10px; font-weight: 700; }
+.task-cancel:hover { border-color: #b8483a; color: #fff; background: #b8483a; }
 .runtime-ready { color: #487353; font-size: 11px; font-weight: 700; }
 .failed .status { color: #b8483a; }
 .failed .status i { background: #d95a4b; }
+.interrupted .status, .cancelled .status { color: #8a6f51; }
+.interrupted .status i, .cancelled .status i { background: #c79561; }
+.orphaned .status { color: #b8483a; }
+.orphaned .status i { background: #d95a4b; }
 .empty-library { padding: 76px 20px; text-align: center; color: #746e63; }
 .empty-library > span { display: block; margin-bottom: 12px; color: #e3644f; font: 38px/1 "Fraunces", serif; }
 .empty-library h3 { margin: 0 0 8px; color: #31433b; font: 600 23px "Fraunces", "Songti SC", serif; }
@@ -178,6 +184,14 @@ h2 { margin-bottom: 0; font: 600 25px/1.1 "Fraunces", "Songti SC", serif; letter
 .settings-list span { color: #7c7569; font-size: 10px; }
 .settings-list section > button { border: 0; padding: 8px 0; color: #416052; background: none; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .settings-list select { min-width: 168px; border: 1px solid #bdb5a7; padding: 8px; color: #435047; background: #f5f2e9; font-size: 10px; }
+.settings-list .model-timeout { align-items: flex-start; min-height: 178px; }
+.model-timeout dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 15px 0 0; }
+.model-timeout dl div { padding: 9px; border: 1px solid #d4ccbd; background: #f7f4eb; }
+.model-timeout dt { color: #5e6d63; font-size: 9px; }
+.model-timeout dd { margin: 5px 0 0; color: #34463d; font: 10px "DM Mono", monospace; }
+.timeout-controls { display: grid; justify-items: end; gap: 12px; min-width: 168px; padding-top: 4px; }
+.timeout-controls label { display: flex; align-items: center; gap: 9px; }
+.timeout-controls label span { color: #53645a; font-size: 10px; }
 .toggle { width: 40px; height: 21px; padding: 2px !important; border: 1px solid #bbb3a5 !important; background: transparent !important; border-radius: 30px !important; }
 .toggle i { display: block; width: 15px; height: 15px; border-radius: 50%; background: #a39c90; transition: transform .2s ease, background .2s ease; }
 .toggle.on { border-color: #5a8260 !important; background: #5a8260 !important; }

@@ -1,10 +1,16 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager};
@@ -85,6 +91,8 @@ struct MediaMetadata {
 struct Preferences {
     cleanup_temp_media: bool,
     transcription_language: String,
+    summary_timeout_manual: bool,
+    summary_timeout_minutes: u64,
 }
 
 const BASE_MODEL_URL: &str =
@@ -96,6 +104,101 @@ const LEGACY_APP_DATA_DIR: &str = "com.maximusmol.video-knowledge";
 const LEGACY_DATABASE_FILE: &str = "video-knowledge.sqlite3";
 const DATABASE_FILE: &str = "quickvideo.sqlite3";
 const DEFAULT_SUMMARY_PROMPT: &str = "请将下面的视频字幕整理为中文 Markdown 笔记。\n\n请包含：\n1. 一句话概览\n2. 3-5 条核心收获\n3. 按时间切分的章节：每章包含标题、时间范围和要点\n\n只基于字幕中的信息，不要编造事实。";
+const API_KEY_TEST_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_SUMMARY_TIMEOUT_MINUTES: u64 = 10;
+const SUMMARY_TIMEOUT_OPTIONS: [u64; 6] = [5, 10, 15, 20, 25, 30];
+const TASK_CANCELLED: &str = "任务已由用户终止。";
+
+#[derive(Clone, Default)]
+struct TaskRegistry {
+    controls: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+}
+
+impl TaskRegistry {
+    fn control(&self, task_id: i64) -> Arc<AtomicBool> {
+        let mut controls = self.controls.lock().expect("task registry lock poisoned");
+        controls
+            .entry(task_id)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn cancel(&self, task_id: i64) -> bool {
+        let controls = self.controls.lock().expect("task registry lock poisoned");
+        let Some(control) = controls.get(&task_id) else {
+            return false;
+        };
+        control.store(true, Ordering::SeqCst);
+        true
+    }
+
+    fn release(&self, task_id: i64) {
+        self.controls
+            .lock()
+            .expect("task registry lock poisoned")
+            .remove(&task_id);
+    }
+}
+
+fn run_task_command(
+    registry: &TaskRegistry,
+    task_id: i64,
+    command: &mut Command,
+) -> Result<Output, String> {
+    let control = registry.control(task_id);
+    if control.load(Ordering::SeqCst) {
+        return Err(TASK_CANCELLED.into());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动处理工具：{error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取处理工具输出。".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取处理工具错误输出。".to_string())?;
+    let read_pipe = |mut pipe: std::process::ChildStdout| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(bytes)
+    };
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut pipe = stderr;
+        pipe.read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(bytes)
+    });
+    loop {
+        if control.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(TASK_CANCELLED.into());
+        }
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| "无法读取处理工具输出。".to_string())??;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| "无法读取处理工具错误输出。".to_string())??;
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
 
 fn executable_name(tool: &str) -> String {
     if cfg!(target_os = "windows") {
@@ -344,6 +447,14 @@ fn get_preferences(app: tauri::AppHandle) -> Result<Preferences, String> {
             .unwrap_or(true),
         transcription_language: setting(&conn, "transcription_language")
             .unwrap_or_else(|_| "自动识别（中文 / English）".into()),
+        summary_timeout_manual: setting(&conn, "summary_timeout_manual")
+            .map(|value| value == "true")
+            .unwrap_or(false),
+        summary_timeout_minutes: setting(&conn, "summary_timeout_minutes")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| SUMMARY_TIMEOUT_OPTIONS.contains(value))
+            .unwrap_or(DEFAULT_SUMMARY_TIMEOUT_MINUTES),
     })
 }
 
@@ -352,15 +463,40 @@ fn save_preferences(
     app: tauri::AppHandle,
     cleanup_temp_media: bool,
     transcription_language: String,
+    summary_timeout_manual: bool,
+    summary_timeout_minutes: u64,
 ) -> Result<(), String> {
+    if !SUMMARY_TIMEOUT_OPTIONS.contains(&summary_timeout_minutes) {
+        return Err("摘要最大等待时长必须为 5、10、15、20、25 或 30 分钟。".into());
+    }
     let conn = connection(&app)?;
     for (key, value) in [
         ("cleanup_temp_media", cleanup_temp_media.to_string()),
         ("transcription_language", transcription_language),
+        ("summary_timeout_manual", summary_timeout_manual.to_string()),
+        (
+            "summary_timeout_minutes",
+            summary_timeout_minutes.to_string(),
+        ),
     ] {
         conn.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn summary_timeout(app: &tauri::AppHandle) -> Duration {
+    let preferences = get_preferences(app.clone()).unwrap_or(Preferences {
+        cleanup_temp_media: true,
+        transcription_language: "自动识别（中文 / English）".into(),
+        summary_timeout_manual: false,
+        summary_timeout_minutes: DEFAULT_SUMMARY_TIMEOUT_MINUTES,
+    });
+    let minutes = if preferences.summary_timeout_manual {
+        preferences.summary_timeout_minutes
+    } else {
+        DEFAULT_SUMMARY_TIMEOUT_MINUTES
+    };
+    Duration::from_secs(minutes * 60)
 }
 
 fn cleanup_temp_media(app: &tauri::AppHandle) -> bool {
@@ -614,6 +750,7 @@ fn chat_completion(
     key: &str,
     purpose: &str,
     prompt: String,
+    timeout: Duration,
 ) -> Result<String, String> {
     let started = Instant::now();
     let request_body = serde_json::to_string_pretty(&serde_json::json!({"model": config.model, "messages": [{"role":"user","content":prompt}], "temperature":0.2, "enable_thinking": false, "stream": false})).unwrap_or_default();
@@ -622,7 +759,7 @@ fn chat_completion(
     );
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(600))
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("无法创建直连网络客户端：{e}"))?;
     let response = client
@@ -709,13 +846,17 @@ fn chat_completion_stream(
     stage: &str,
     reset_preview: bool,
     prompt: String,
+    deadline: Instant,
 ) -> Result<String, String> {
+    let timeout = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "摘要生成超过最大等待时长。".to_string())?;
     let started = Instant::now();
     let request_body = serde_json::to_string_pretty(&serde_json::json!({"model": config.model, "messages": [{"role":"user","content":prompt}], "temperature":0.2, "enable_thinking": false, "stream": true})).unwrap_or_default();
     let request_headers = "Accept: text/event-stream\nContent-Type: application/json\nAuthorization: Bearer [REDACTED]\nUser-Agent: QuickVideo".to_string();
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(600))
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("无法创建直连网络客户端：{e}"))?;
     let response = client
@@ -878,6 +1019,7 @@ fn generate_summary_blocking(app: tauri::AppHandle, transcript: String) -> Resul
     if chunks.is_empty() {
         return Err("字幕为空，无法生成摘要。".into());
     }
+    let deadline = Instant::now() + summary_timeout(&app);
     if chunks.len() == 1 {
         return chat_completion_stream(
             &app,
@@ -887,11 +1029,12 @@ fn generate_summary_blocking(app: tauri::AppHandle, transcript: String) -> Resul
             "正在生成最终摘要",
             false,
             format!("{}\n\n字幕：\n{}", config.summary_prompt, chunks[0]),
+            deadline,
         );
     }
     let total = chunks.len();
-    let partials = chunks.iter().enumerate().map(|(index, chunk)| chat_completion_stream(&app, &config, &key, &format!("流式长视频分段 {}/{}", index + 1, total), &format!("正在提炼第 {} / {} 段", index + 1, total), false, format!("这是长视频字幕的第 {} / {} 段。请只基于本段内容提炼带时间范围的章节候选、事实与关键点，保留具体时间戳；不要给出全片结论，也不要编造。\n\n字幕：\n{chunk}", index + 1, total))).collect::<Result<Vec<_>, _>>()?;
-    chat_completion_stream(&app, &config, &key, "流式合并长视频摘要", "正在合并最终摘要", true, format!("{}\n\n以下是按顺序提炼的长视频分段笔记。请只使用这些分段事实，删除重复，不要编造。\n\n{}", config.summary_prompt, partials.join("\n\n---\n\n")))
+    let partials = chunks.iter().enumerate().map(|(index, chunk)| chat_completion_stream(&app, &config, &key, &format!("流式长视频分段 {}/{}", index + 1, total), &format!("正在提炼第 {} / {} 段", index + 1, total), false, format!("这是长视频字幕的第 {} / {} 段。请只基于本段内容提炼带时间范围的章节候选、事实与关键点，保留具体时间戳；不要给出全片结论，也不要编造。\n\n字幕：\n{chunk}", index + 1, total), deadline)).collect::<Result<Vec<_>, _>>()?;
+    chat_completion_stream(&app, &config, &key, "流式合并长视频摘要", "正在合并最终摘要", true, format!("{}\n\n以下是按顺序提炼的长视频分段笔记。请只使用这些分段事实，删除重复，不要编造。\n\n{}", config.summary_prompt, partials.join("\n\n---\n\n")), deadline)
 }
 
 #[tauri::command]
@@ -907,7 +1050,15 @@ fn test_model_connection_blocking(app: tauri::AppHandle) -> Result<(), String> {
         return Err("请先保存 API Key。".into());
     }
     let key = configured_api_key(&app)?;
-    chat_completion(&app, &config, &key, "连接测试", "请只回复：连接成功".into()).map(|_| ())
+    chat_completion(
+        &app,
+        &config,
+        &key,
+        "连接测试",
+        "请只回复：连接成功".into(),
+        Duration::from_secs(API_KEY_TEST_TIMEOUT_SECONDS),
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]
@@ -963,6 +1114,31 @@ fn list_tasks(app: tauri::AppHandle) -> Result<Vec<Task>, String> {
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn recover_incomplete_tasks(app: tauri::AppHandle) -> Result<usize, String> {
+    let conn = connection(&app)?;
+    conn.execute(
+        "UPDATE tasks SET state='interrupted', progress=0, error_message='应用关闭后任务未完成，请重新开始。', created_at=?1 WHERE state IN ('queued', 'preparing', 'transcribing', 'summarizing', 'cancelling', 'orphaned')",
+        [chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn cancel_task(task_id: i64, registry: tauri::State<'_, TaskRegistry>) -> Result<bool, String> {
+    Ok(registry.cancel(task_id))
+}
+
+#[tauri::command]
+fn activate_task(task_id: i64, registry: tauri::State<'_, TaskRegistry>) {
+    registry.control(task_id).store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn release_task(task_id: i64, registry: tauri::State<'_, TaskRegistry>) {
+    registry.release(task_id);
 }
 
 #[tauri::command]
@@ -1032,13 +1208,33 @@ fn clear_tasks(app: tauri::AppHandle) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+fn export_origin(source: &str, input_ref: &str) -> String {
+    if source.contains("链接") {
+        format!("> 原始链接：<{input_ref}>  \n")
+    } else {
+        let filename = Path::new(input_ref)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(input_ref);
+        format!("> 本地文件：{filename}  \n")
+    }
+}
+
 #[tauri::command]
 fn export_markdown(
     app: tauri::AppHandle,
     title: String,
     task_id: Option<i64>,
     output_path: Option<String>,
+    export_type: String,
 ) -> Result<String, String> {
+    if !matches!(
+        export_type.as_str(),
+        "summaryAndTranscript" | "summary" | "transcript"
+    ) {
+        return Err("未知的导出类型。".into());
+    }
     let path = match output_path {
         Some(value) => PathBuf::from(value),
         None => {
@@ -1061,12 +1257,46 @@ fn export_markdown(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let body = task_id.and_then(|id| {
-        let conn = connection(&app).ok()?;
-        let metadata = conn.query_row("SELECT source,duration,subtitle_source,created_at FROM tasks WHERE id=?1", [id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))).ok()?;
-        let (transcript, summary) = get_note(app.clone(), id).ok()?;
-        Some(format!("# {title}\n\n> 来源：{}  \n> 时长：{}  \n> 字幕：{}  \n> 整理时间：{}\n\n{}\n\n## 全文字幕\n\n{}\n", metadata.0, metadata.1, metadata.2.unwrap_or_else(|| "未标记".into()), metadata.3, summary, transcript))
-    }).unwrap_or_else(|| format!("# {title}\n\n这是一份由快看视频 QuickVideo 生成的结构化视频笔记。\n"));
+    let body = task_id
+        .and_then(|id| {
+            let conn = connection(&app).ok()?;
+            let metadata = conn
+                .query_row(
+                    "SELECT source,duration,subtitle_source,created_at,input_ref FROM tasks WHERE id=?1",
+                    [id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .ok()?;
+            let (transcript, summary) = get_note(app.clone(), id).ok()?;
+            let metadata = format!(
+                "# {title}\n\n> 来源：{}  \n{}> 时长：{}  \n> 字幕：{}  \n> 整理时间：{}\n",
+                metadata.0,
+                export_origin(&metadata.0, &metadata.4),
+                metadata.1,
+                metadata.2.unwrap_or_else(|| "未标记".into()),
+                metadata.3
+            );
+            let content = match export_type.as_str() {
+                "summaryAndTranscript" => {
+                    format!("\n{}\n\n## 全文字幕\n\n{}\n", summary, transcript)
+                }
+                "summary" => format!("\n{}\n", summary),
+                "transcript" => format!("\n## 全文字幕\n\n{}\n", transcript),
+                _ => unreachable!("export type was validated above"),
+            };
+            Some(format!("{metadata}{content}"))
+        })
+        .unwrap_or_else(|| {
+            format!("# {title}\n\n这是一份由快看视频 QuickVideo 生成的结构化视频笔记。\n")
+        });
     fs::write(&path, body).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -1075,15 +1305,22 @@ fn export_markdown(
 async fn transcribe_local_file(
     app: tauri::AppHandle,
     input_path: String,
+    task_id: i64,
+    registry: tauri::State<'_, TaskRegistry>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || transcribe_local_file_blocking(app, input_path))
-        .await
-        .map_err(|e| format!("后台转写任务中断：{e}"))?
+    let registry = registry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        transcribe_local_file_blocking(app, input_path, task_id, registry)
+    })
+    .await
+    .map_err(|e| format!("后台转写任务中断：{e}"))?
 }
 
 fn transcribe_local_file_blocking(
     app: tauri::AppHandle,
     input_path: String,
+    task_id: i64,
+    registry: TaskRegistry,
 ) -> Result<String, String> {
     let work = app
         .path()
@@ -1094,21 +1331,24 @@ fn transcribe_local_file_blocking(
     let id = chrono::Utc::now().timestamp_millis();
     let wav = work.join(format!("{id}.wav"));
     let output = work.join(format!("{id}-transcript"));
-    let ffmpeg = Command::new(tool_path("ffmpeg")?)
-        .args([
-            "-y",
-            "-i",
-            &input_path,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-        ])
-        .arg(&wav)
-        .output()
-        .map_err(|e| format!("无法启动 FFmpeg：{e}"))?;
+    let mut ffmpeg_command = Command::new(tool_path("ffmpeg")?);
+    let ffmpeg = run_task_command(
+        &registry,
+        task_id,
+        ffmpeg_command
+            .args([
+                "-y",
+                "-i",
+                &input_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&wav),
+    )?;
     if !ffmpeg.status.success() {
         return Err(String::from_utf8_lossy(&ffmpeg.stderr).into_owned());
     }
@@ -1117,15 +1357,18 @@ fn transcribe_local_file_blocking(
         return Err("未找到本地语音模型，请在设置中下载模型。".into());
     }
     let language = whisper_language(&app);
-    let whisper = Command::new(tool_path("whisper-cli")?)
-        .args(["-m"])
-        .arg(model)
-        .args(["-f"])
-        .arg(&wav)
-        .args(["-l", &language, "-osrt", "-of"])
-        .arg(&output)
-        .output()
-        .map_err(|e| format!("无法启动 whisper.cpp：{e}"))?;
+    let mut whisper_command = Command::new(tool_path("whisper-cli")?);
+    let whisper = run_task_command(
+        &registry,
+        task_id,
+        whisper_command
+            .args(["-m"])
+            .arg(model)
+            .args(["-f"])
+            .arg(&wav)
+            .args(["-l", &language, "-osrt", "-of"])
+            .arg(&output),
+    )?;
     if cleanup_temp_media(&app) {
         let _ = fs::remove_file(&wav);
     }
@@ -1141,13 +1384,26 @@ fn transcribe_local_file_blocking(
 }
 
 #[tauri::command]
-async fn transcribe_platform_link(app: tauri::AppHandle, url: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || transcribe_platform_link_blocking(app, url))
-        .await
-        .map_err(|e| format!("后台转写任务中断：{e}"))?
+async fn transcribe_platform_link(
+    app: tauri::AppHandle,
+    url: String,
+    task_id: i64,
+    registry: tauri::State<'_, TaskRegistry>,
+) -> Result<String, String> {
+    let registry = registry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        transcribe_platform_link_blocking(app, url, task_id, registry)
+    })
+    .await
+    .map_err(|e| format!("后台转写任务中断：{e}"))?
 }
 
-fn transcribe_platform_link_blocking(app: tauri::AppHandle, url: String) -> Result<String, String> {
+fn transcribe_platform_link_blocking(
+    app: tauri::AppHandle,
+    url: String,
+    task_id: i64,
+    registry: TaskRegistry,
+) -> Result<String, String> {
     if !(url.contains("youtube.com") || url.contains("youtu.be") || url.contains("bilibili.com")) {
         return Err("目前仅支持 YouTube 与 Bilibili 链接。".into());
     }
@@ -1161,12 +1417,15 @@ fn transcribe_platform_link_blocking(app: tauri::AppHandle, url: String) -> Resu
         "link-audio-{}",
         chrono::Utc::now().timestamp_millis()
     ));
-    let downloaded = ytdlp_command()?
-        .args(["--no-playlist", "-x", "--audio-format", "wav", "-o"])
-        .arg(format!("{}.%(ext)s", prefix.display()))
-        .arg(&url)
-        .output()
-        .map_err(|e| format!("无法启动临时音频工具：{e}"))?;
+    let mut download_command = ytdlp_command()?;
+    let downloaded = run_task_command(
+        &registry,
+        task_id,
+        download_command
+            .args(["--no-playlist", "-x", "--audio-format", "wav", "-o"])
+            .arg(format!("{}.%(ext)s", prefix.display()))
+            .arg(&url),
+    )?;
     if !downloaded.status.success() {
         return Err(format!(
             "无法取得可处理的临时音频：{}",
@@ -1201,15 +1460,18 @@ fn transcribe_platform_link_blocking(app: tauri::AppHandle, url: String) -> Resu
         }
         return Err("未找到本地语音模型，请在设置中下载模型。".into());
     }
-    let whisper = Command::new(tool_path("whisper-cli")?)
-        .args(["-m"])
-        .arg(model)
-        .args(["-f"])
-        .arg(&audio)
-        .args(["-l", &whisper_language(&app), "-osrt", "-of"])
-        .arg(&output)
-        .output()
-        .map_err(|e| format!("无法启动 whisper.cpp：{e}"))?;
+    let mut whisper_command = Command::new(tool_path("whisper-cli")?);
+    let whisper = run_task_command(
+        &registry,
+        task_id,
+        whisper_command
+            .args(["-m"])
+            .arg(model)
+            .args(["-f"])
+            .arg(&audio)
+            .args(["-l", &whisper_language(&app), "-osrt", "-of"])
+            .arg(&output),
+    )?;
     if cleanup_temp_media(&app) {
         let _ = fs::remove_file(&audio);
     }
@@ -1250,15 +1512,22 @@ fn read_platform_srt(
 async fn fetch_platform_subtitles(
     app: tauri::AppHandle,
     url: String,
+    task_id: i64,
+    registry: tauri::State<'_, TaskRegistry>,
 ) -> Result<PlatformSubtitles, String> {
-    tauri::async_runtime::spawn_blocking(move || fetch_platform_subtitles_blocking(app, url))
-        .await
-        .map_err(|e| format!("后台字幕任务中断：{e}"))?
+    let registry = registry.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_platform_subtitles_blocking(app, url, task_id, registry)
+    })
+    .await
+    .map_err(|e| format!("后台字幕任务中断：{e}"))?
 }
 
 fn fetch_platform_subtitles_blocking(
     app: tauri::AppHandle,
     url: String,
+    task_id: i64,
+    registry: TaskRegistry,
 ) -> Result<PlatformSubtitles, String> {
     if !(url.contains("youtube.com") || url.contains("youtu.be") || url.contains("bilibili.com")) {
         return Err("目前仅支持 YouTube 与 Bilibili 链接。".into());
@@ -1276,40 +1545,46 @@ fn fetch_platform_subtitles_blocking(
         .ok_or_else(|| "无法创建临时字幕文件。".to_string())?
         .to_string_lossy()
         .into_owned();
-    let manual = ytdlp_command()?
-        .args([
-            "--skip-download",
-            "--write-subs",
-            "--sub-langs",
-            "zh.*,en.*",
-            "--convert-subs",
-            "srt",
-            "-o",
-        ])
-        .arg(&template)
-        .arg(&url)
-        .output()
-        .map_err(|e| format!("无法启动字幕工具：{e}"))?;
+    let mut manual_command = ytdlp_command()?;
+    let manual = run_task_command(
+        &registry,
+        task_id,
+        manual_command
+            .args([
+                "--skip-download",
+                "--write-subs",
+                "--sub-langs",
+                "zh.*,en.*",
+                "--convert-subs",
+                "srt",
+                "-o",
+            ])
+            .arg(&template)
+            .arg(&url),
+    )?;
     if let Some(transcript) = read_platform_srt(&app, &work, &expected_prefix)? {
         return Ok(PlatformSubtitles {
             transcript,
             source: "平台人工字幕".into(),
         });
     }
-    let automatic = ytdlp_command()?
-        .args([
-            "--skip-download",
-            "--write-auto-subs",
-            "--sub-langs",
-            "zh.*,en.*",
-            "--convert-subs",
-            "srt",
-            "-o",
-        ])
-        .arg(&template)
-        .arg(&url)
-        .output()
-        .map_err(|e| format!("无法启动字幕工具：{e}"))?;
+    let mut automatic_command = ytdlp_command()?;
+    let automatic = run_task_command(
+        &registry,
+        task_id,
+        automatic_command
+            .args([
+                "--skip-download",
+                "--write-auto-subs",
+                "--sub-langs",
+                "zh.*,en.*",
+                "--convert-subs",
+                "srt",
+                "-o",
+            ])
+            .arg(&template)
+            .arg(&url),
+    )?;
     if let Some(transcript) = read_platform_srt(&app, &work, &expected_prefix)? {
         return Ok(PlatformSubtitles {
             transcript,
@@ -1325,7 +1600,7 @@ fn fetch_platform_subtitles_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, transcript_chunks};
+    use super::{export_origin, format_duration, transcript_chunks};
 
     #[test]
     fn formats_media_duration() {
@@ -1342,11 +1617,24 @@ mod tests {
         assert!(chunks[0].contains("first"));
         assert!(chunks[1].contains("third"));
     }
+
+    #[test]
+    fn exports_the_original_link_or_local_filename() {
+        assert_eq!(
+            export_origin("YouTube 链接", "https://example.com/watch?v=123"),
+            "> 原始链接：<https://example.com/watch?v=123>  \n"
+        );
+        assert_eq!(
+            export_origin("本地文件 · whisper.cpp", "/Users/me/Videos/lecture.mp4"),
+            "> 本地文件：lecture.mp4  \n"
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(TaskRegistry::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1355,9 +1643,13 @@ pub fn run() {
             get_local_duration,
             get_link_metadata,
             list_tasks,
+            recover_incomplete_tasks,
             create_task,
             update_task,
             update_task_metadata,
+            activate_task,
+            cancel_task,
+            release_task,
             clear_tasks,
             save_note,
             get_note,
