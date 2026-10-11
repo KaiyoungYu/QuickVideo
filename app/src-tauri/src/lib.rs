@@ -65,11 +65,15 @@ struct SummaryStreamDelta {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RuntimeStatus {
     ffmpeg: bool,
     whisper: bool,
     model: bool,
     ytdlp: bool,
+    ytdlp_version: Option<String>,
+    ytdlp_outdated: bool,
+    ytdlp_upgrade_hint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +294,77 @@ fn ytdlp_command() -> Result<Command, String> {
     Ok(command)
 }
 
+const YTDLP_STALE_DAYS: i64 = 90;
+
+/// yt-dlp 的版本号即发布日期，例如 "2026.08.19"。
+fn parse_ytdlp_version_date(version: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(version.trim(), "%Y.%m.%d").ok()
+}
+
+fn ytdlp_version_age_days(version: &str, today: chrono::NaiveDate) -> Option<i64> {
+    parse_ytdlp_version_date(version).map(|release| (today - release).num_days())
+}
+
+fn is_ytdlp_outdated(version: &str, today: chrono::NaiveDate) -> bool {
+    ytdlp_version_age_days(version, today).is_some_and(|age| age >= YTDLP_STALE_DAYS)
+}
+
+fn ytdlp_upgrade_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "请在终端运行 pip install -U yt-dlp 完成升级。"
+    } else {
+        "请在终端运行 brew update && brew upgrade yt-dlp 完成升级。"
+    }
+}
+
+/// 把 yt-dlp stderr 重写为可行动的中文提示；无法识别的保持原文（trim 后）。
+fn friendly_ytdlp_error(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return "处理工具没有返回具体错误信息。".to_string();
+    }
+    // 取消消息原样透传，前端靠它区分“用户终止”。
+    if trimmed.contains(TASK_CANCELLED) {
+        return trimmed.to_string();
+    }
+    // 过期判定放在 403 之前：过期场景常同时打印 WARNING 与 403，过期才是根因。
+    if trimmed.contains("older than 90 days") || trimmed.contains("Your yt-dlp version") {
+        return format!(
+            "yt-dlp 版本已过期（发布已超过 90 天），平台接口可能因此失效。{}",
+            ytdlp_upgrade_hint()
+        );
+    }
+    if trimmed.contains("HTTP Error 403") {
+        return format!(
+            "下载被平台拒绝（HTTP 403），通常是 yt-dlp 过期或当前网络 IP 受限。{}",
+            ytdlp_upgrade_hint()
+        );
+    }
+    if trimmed.contains("SSL")
+        || trimmed.contains("UNEXPECTED_EOF")
+        || trimmed.contains("Connection reset")
+    {
+        return "网络连接不稳定或被中断，请检查网络与代理设置后重试。".to_string();
+    }
+    trimmed.to_string()
+}
+
+/// 运行 `yt-dlp --version` 并返回首行输出（例如 "2026.08.19"）。
+fn ytdlp_version() -> Option<String> {
+    let path = tool_path("yt-dlp").ok()?;
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
 fn migrate_legacy_app_data(app: &tauri::AppHandle) -> Result<(), String> {
     let current_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&current_dir).map_err(|e| e.to_string())?;
@@ -340,11 +415,18 @@ fn check_runtime(app: tauri::AppHandle) -> Result<RuntimeStatus, String> {
         tool_path(tool).is_ok_and(|path| Command::new(path).arg("--version").output().is_ok())
     };
     let model = base_model_path(&app)?.exists();
+    let ytdlp_version = ytdlp_version();
+    let today = chrono::Local::now().date_naive();
     Ok(RuntimeStatus {
         ffmpeg: available("ffmpeg"),
         whisper: available("whisper-cli"),
         model,
-        ytdlp: available("yt-dlp"),
+        ytdlp: ytdlp_version.is_some(),
+        ytdlp_outdated: ytdlp_version
+            .as_deref()
+            .is_some_and(|version| is_ytdlp_outdated(version, today)),
+        ytdlp_version,
+        ytdlp_upgrade_hint: ytdlp_upgrade_hint().to_string(),
     })
 }
 
@@ -585,7 +667,7 @@ fn get_link_metadata_blocking(url: String) -> Result<MediaMetadata, String> {
         .output()
         .map_err(|e| format!("无法读取视频信息：{e}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(friendly_ytdlp_error(&String::from_utf8_lossy(&output.stderr)));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines = stdout
@@ -1429,7 +1511,7 @@ fn transcribe_platform_link_blocking(
     if !downloaded.status.success() {
         return Err(format!(
             "无法取得可处理的临时音频：{}",
-            String::from_utf8_lossy(&downloaded.stderr)
+            friendly_ytdlp_error(&String::from_utf8_lossy(&downloaded.stderr))
         ));
     }
     let audio_prefix = prefix
@@ -1591,16 +1673,26 @@ fn fetch_platform_subtitles_blocking(
             source: "平台自动字幕".into(),
         });
     }
+    let manual_error = friendly_ytdlp_error(&String::from_utf8_lossy(&manual.stderr));
+    let automatic_error = friendly_ytdlp_error(&String::from_utf8_lossy(&automatic.stderr));
     Err(format!(
-        "未发现可用字幕。{}{}",
-        String::from_utf8_lossy(&manual.stderr),
-        String::from_utf8_lossy(&automatic.stderr)
+        "未发现可用字幕。{}",
+        if manual_error == automatic_error {
+            manual_error
+        } else {
+            format!("{manual_error} {automatic_error}")
+        }
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{export_origin, format_duration, transcript_chunks};
+    use super::{
+        export_origin, format_duration, friendly_ytdlp_error, is_ytdlp_outdated,
+        parse_ytdlp_version_date, transcript_chunks, ytdlp_upgrade_hint, ytdlp_version_age_days,
+        TASK_CANCELLED,
+    };
+    use chrono::NaiveDate;
 
     #[test]
     fn formats_media_duration() {
@@ -1628,6 +1720,84 @@ mod tests {
             export_origin("本地文件 · whisper.cpp", "/Users/me/Videos/lecture.mp4"),
             "> 本地文件：lecture.mp4  \n"
         );
+    }
+
+    #[test]
+    fn translates_stale_ytdlp_stderr() {
+        let stderr = "WARNING: Your yt-dlp version (2026.07.04) is older than 90 days! It is strongly recommended to always use the latest version.\nERROR: unable to download video data: HTTP Error 403: Forbidden";
+        let message = friendly_ytdlp_error(stderr);
+        assert!(message.contains("过期"));
+        assert!(message.contains("brew upgrade yt-dlp"));
+        assert!(!message.contains("WARNING"));
+    }
+
+    #[test]
+    fn translates_http_403_stderr() {
+        let message =
+            friendly_ytdlp_error("ERROR: unable to download video data: HTTP Error 403: Forbidden");
+        assert!(message.contains("403"));
+        assert!(message.contains("拒绝"));
+    }
+
+    #[test]
+    fn translates_network_stderr() {
+        for stderr in [
+            "ERROR: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed (_ssl.c:1082)",
+            "ERROR: Unable to download webpage: SSL: UNEXPECTED_EOF_WHILE_READING",
+            "ERROR: Unable to download webpage: Connection reset by peer",
+        ] {
+            assert!(friendly_ytdlp_error(stderr).contains("网络"));
+        }
+    }
+
+    #[test]
+    fn keeps_unknown_stderr_verbatim() {
+        let stderr = "ERROR: Unsupported URL: https://example.com/watch";
+        assert_eq!(friendly_ytdlp_error(stderr), stderr);
+    }
+
+    #[test]
+    fn passes_cancellation_through_unchanged() {
+        assert_eq!(friendly_ytdlp_error(TASK_CANCELLED), TASK_CANCELLED);
+        let embedded = format!("transcribe: {TASK_CANCELLED}");
+        assert_eq!(friendly_ytdlp_error(&embedded), embedded);
+    }
+
+    #[test]
+    fn empty_stderr_becomes_generic_message() {
+        assert_eq!(
+            friendly_ytdlp_error("  \n"),
+            "处理工具没有返回具体错误信息。"
+        );
+    }
+
+    #[test]
+    fn parses_ytdlp_release_dates() {
+        assert_eq!(
+            parse_ytdlp_version_date("2026.08.19"),
+            NaiveDate::from_ymd_opt(2026, 8, 19)
+        );
+        for malformed in ["2026-08-19", "", "latest", "2026.13.01", "2026.08.19.dev"] {
+            assert_eq!(parse_ytdlp_version_date(malformed), None);
+        }
+    }
+
+    #[test]
+    fn ytdlp_outdated_boundary() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        assert!(!is_ytdlp_outdated("2026.07.14", today)); // 89 天
+        assert!(is_ytdlp_outdated("2026.07.13", today)); // 恰好 90 天
+        assert!(is_ytdlp_outdated("2026.07.12", today)); // 91 天
+        assert!(!is_ytdlp_outdated("2026.10.01", today)); // 未来日期
+        assert!(!is_ytdlp_outdated("not-a-date", today)); // 无法解析不误报
+    }
+
+    #[test]
+    fn ytdlp_age_and_hint_report_platform_tool() {
+        let age =
+            ytdlp_version_age_days("2026.07.04", NaiveDate::from_ymd_opt(2026, 10, 11).unwrap());
+        assert_eq!(age, Some(99));
+        assert!(ytdlp_upgrade_hint().contains("yt-dlp"));
     }
 }
 

@@ -25,6 +25,7 @@ type PlatformSubtitles = { transcript: string; source: string };
 type MediaMetadata = { title: string; duration: string };
 type SelectedLocalFile = { path: string; name: string };
 type ApiCall = { id: number; createdAt: string; purpose: string; provider: string; baseUrl: string; model: string; success: boolean; statusCode?: number | null; durationMs: number; errorMessage?: string | null; traceId?: string | null; requestHeaders?: string | null; requestBody?: string | null; responseHeaders?: string | null; responseBody?: string | null };
+type RuntimeStatus = { ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean; ytdlpVersion?: string | null; ytdlpOutdated?: boolean; ytdlpUpgradeHint?: string };
 type ExportType = "summaryAndTranscript" | "summary" | "transcript";
 
 const stateCopy: Record<TaskState, string> = {
@@ -83,7 +84,7 @@ function App() {
       })
       .then(setTasks)
       .catch(() => setNotice("本地资料库暂不可用，请重新启动桌面 App。"));
-    invoke<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean }>("check_runtime").then((runtime) => { if (!runtime.ffmpeg || !runtime.whisper || !runtime.model) setNotice("本地转写组件尚未完整安装，请在设置中完成模型与工具检查。 "); }).catch(() => undefined);
+    invoke<RuntimeStatus>("check_runtime").then((runtime) => { if (!runtime.ytdlp) setNotice("未检测到 yt-dlp，暂时无法分析平台链接；可在设置中查看工具状态，或先导入本地文件。"); else if (runtime.ytdlpOutdated) setNotice(`检测到 yt-dlp（${runtime.ytdlpVersion ?? "版本未知"}）已超过 90 天未更新，链接分析可能失败。${runtime.ytdlpUpgradeHint ?? ""}`); else if (!runtime.ffmpeg || !runtime.whisper || !runtime.model) setNotice("本地转写组件尚未完整安装，请在设置中完成模型与工具检查。 "); }).catch(() => undefined);
   }, []);
   const updateTask = (id: number, changes: Partial<VideoTask>) => {
     setTasks((current) =>
@@ -461,11 +462,11 @@ function SettingsPage({ onBack, onEditModel, onClearLibrary }: { onBack: () => v
   const [summaryTimeoutManual, setSummaryTimeoutManual] = useState(false);
   const [summaryTimeoutMinutes, setSummaryTimeoutMinutes] = useState(10);
   const [saved, setSaved] = useState("");
-  const [runtime, setRuntime] = useState<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean } | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [downloadingModel, setDownloadingModel] = useState(false);
   const [apiCalls, setApiCalls] = useState<ApiCall[]>([]);
   const [callsLoading, setCallsLoading] = useState(false);
-  const refreshRuntime = () => { void invoke<{ ffmpeg: boolean; whisper: boolean; model: boolean; ytdlp: boolean }>("check_runtime").then(setRuntime).catch(() => setRuntime(null)); };
+  const refreshRuntime = () => { void invoke<RuntimeStatus>("check_runtime").then(setRuntime).catch(() => setRuntime(null)); };
   const refreshCalls = () => { setCallsLoading(true); void invoke<ApiCall[]>("list_api_calls").then(setApiCalls).catch(() => setApiCalls([])).finally(() => setCallsLoading(false)); };
   useEffect(() => { invoke<{ cleanupTempMedia: boolean; transcriptionLanguage: string; summaryTimeoutManual: boolean; summaryTimeoutMinutes: number }>("get_preferences").then((value) => { setCleanup(value.cleanupTempMedia); setLanguage(value.transcriptionLanguage); setSummaryTimeoutManual(value.summaryTimeoutManual); setSummaryTimeoutMinutes(value.summaryTimeoutMinutes); }).catch(() => undefined); refreshRuntime(); refreshCalls(); }, []);
   const persist = (nextCleanup: boolean, nextLanguage: string, nextSummaryTimeoutManual = summaryTimeoutManual, nextSummaryTimeoutMinutes = summaryTimeoutMinutes) => {
@@ -483,7 +484,7 @@ function SettingsPage({ onBack, onEditModel, onClearLibrary }: { onBack: () => v
         <div className="settings-list">
           <section><div><p>模型服务</p><span>SiliconFlow · 固定 API 端点</span></div><button type="button" onClick={onEditModel}>编辑 →</button></section>
           <section><div><p>本地转写模型</p><span>{runtime?.model ? "ggml-base 已就绪（约 142 MiB）" : "需要 ggml-base 模型，首次下载约 142 MiB"}</span></div>{runtime?.model ? <span className="runtime-ready">已就绪</span> : <button type="button" disabled={downloadingModel} onClick={() => { setDownloadingModel(true); setSaved("正在从官方模型仓库下载…"); void invoke("download_base_model").then(() => { setSaved("本地转写模型已下载。"); refreshRuntime(); }).catch((error) => setSaved(`模型下载失败：${String(error)}`)).finally(() => setDownloadingModel(false)); }}>{downloadingModel ? "下载中…" : "下载模型 →"}</button>}</section>
-          <section><div><p>本地处理工具</p><span>{runtime ? `FFmpeg ${runtime.ffmpeg ? "✓" : "缺失"} · whisper.cpp ${runtime.whisper ? "✓" : "缺失"} · yt-dlp ${runtime.ytdlp ? "✓" : "缺失"}` : "正在检查运行环境…"}</span></div><button type="button" onClick={refreshRuntime}>重新检查</button></section>
+          <section><div><p>本地处理工具</p><span>{runtime ? `FFmpeg ${runtime.ffmpeg ? "✓" : "缺失"} · whisper.cpp ${runtime.whisper ? "✓" : "缺失"} · yt-dlp ${runtime.ytdlp ? `✓${runtime.ytdlpVersion ? `（${runtime.ytdlpVersion}）` : ""}` : "缺失"}${runtime.ytdlpOutdated ? "，发布已超过 90 天" : ""}` : "正在检查运行环境…"}</span>{runtime?.ytdlp && runtime.ytdlpOutdated && <span className="runtime-stale">已过期 · {runtime.ytdlpUpgradeHint}</span>}</div><button type="button" onClick={refreshRuntime}>重新检查</button></section>
           <section><div><p>默认转写语言</p><span>用于本地 whisper.cpp 的语言提示</span></div><select value={language} onChange={(event) => persist(cleanup, event.target.value)}><option>自动识别（中文 / English）</option><option>中文</option><option>English</option></select></section>
           <section><div><p>任务完成后删除临时媒体</p><span>只保留字幕、笔记和视频元数据</span></div><button className={`toggle ${cleanup ? "on" : ""}`} onClick={() => persist(!cleanup, language)} type="button" aria-label="切换清理临时媒体"><i /></button></section>
           <section className="model-timeout"><div><p>模型响应时长</p><span>测试 API Key 固定最多等待 30 秒</span><dl><div><dt>普通摘要生成</dt><dd>最长 {summaryTimeoutManual ? summaryTimeoutMinutes : 10} 分钟</dd></div><div><dt>流式摘要生成</dt><dd>最长 {summaryTimeoutManual ? summaryTimeoutMinutes : 10} 分钟</dd></div><div><dt>完整摘要任务</dt><dd>{summaryTimeoutManual ? `手动 · 最长 ${summaryTimeoutMinutes} 分钟` : "自动（推荐）· 最长 10 分钟"}</dd></div></dl></div><div className="timeout-controls"><label><span>手动设置</span><button className={`toggle ${summaryTimeoutManual ? "on" : ""}`} onClick={() => persist(cleanup, language, !summaryTimeoutManual)} type="button" aria-label="切换摘要等待时长手动设置"><i /></button></label>{summaryTimeoutManual && <select value={summaryTimeoutMinutes} onChange={(event) => persist(cleanup, language, true, Number(event.target.value))} aria-label="摘要最大等待时长">{[5, 10, 15, 20, 25, 30].map((minutes) => <option key={minutes} value={minutes}>{minutes} 分钟</option>)}</select>}</div></section>

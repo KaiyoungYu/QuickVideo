@@ -130,6 +130,7 @@ h2 { margin-bottom: 0; font: 600 25px/1.1 "Fraunces", "Songti SC", serif; letter
 .task-cancel { border: 1px solid #a89884; padding: 5px 8px; color: #675f54; background: transparent; font-size: 10px; font-weight: 700; }
 .task-cancel:hover { border-color: #b8483a; color: #fff; background: #b8483a; }
 .runtime-ready { color: #487353; font-size: 11px; font-weight: 700; }
+.runtime-stale { display: block; margin-top: 4px; color: #b8483a; font-size: 10px; font-weight: 700; }
 .failed .status { color: #b8483a; }
 .failed .status i { background: #d95a4b; }
 .interrupted .status, .cancelled .status { color: #8a6f51; }
